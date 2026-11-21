@@ -30,15 +30,6 @@ class Bot:
         self.retry_repair = 0.0
         self.repair_started = 0.0
         self.repair_hp = 0.0
-        self.last_progress = None
-        self.check_progress_at = 0.0
-        self.last_heading = (0, 0)
-        self.pulse_until = -1.0
-        self.pulse_started = -1.0
-        self.next_hop = 0.0
-        self.hop_origin = None
-        self.failed_origin = None
-        self.failed_hops = 0
         self.crate_id = None
         self.crate_deadline = 0.0
         self.skip_crate = {}
@@ -57,6 +48,27 @@ class Bot:
             self.anchor = (center[0] + dx * radius, center[1] + dy * radius)
             self.phase = phase
         return self.anchor
+
+    def public_loot_reach(self, obs, item, base_reach):
+        me, zone = obs["self"], obs["zone"]
+        if obs["t"] >= zone["shrink_start"] or me["hp"] < me["max_hp"] * 0.82:
+            return base_reach
+        if me["cubes"] > 0 and None not in me["weapons"]:
+            return base_reach
+        pos, p = me["pos"], item["pos"]
+        # Newly unlocked detours need a clear resource advantage. Preserve
+        # baseline behavior for the nearer items it already considered.
+        if distance(pos, p) < base_reach:
+            return base_reach
+        if any(m["kind"] == "mech" and min(distance(m["pos"], pos), distance(m["pos"], p)) < 75 for m in obs["mechs"]):
+            return base_reach
+        # A single nearby crate already promises a cube and may drop gear.
+        # Do not walk past it for a distant loose item on an empty map.
+        walking_budget = 7.0 * me["stats"]["walk_speed"]
+        for crate in obs["crates"]:
+            if abs(crate["pos"][2] - pos[2]) < 4:
+                walking_budget = min(walking_budget, distance(pos, crate["pos"]) + 2.0 * me["stats"]["walk_speed"])
+        return max(base_reach, walking_budget)
 
     def objective(self, obs):
         me = obs["self"]
@@ -83,14 +95,14 @@ class Bot:
         for cube in obs["cubes"]:
             p = cube["pos"]
             d = distance(pos, p)
-            if d < 32 and can_visit(p, d):
+            if d < self.public_loot_reach(obs, cube, 32) and can_visit(p, d):
                 choices.append((d, cube["id"], p))
         held = {w["kind"] for w in me["weapons"] if w}
         if None in me["weapons"]:
             for item in obs["pickups"]:
                 p = item["pos"]
                 d = distance(pos, p)
-                if item["kind"] in ("laser", "lightning") and item["kind"] not in held and d < 42 and can_visit(p, d):
+                if item["kind"] in ("laser", "lightning") and item["kind"] not in held and d < self.public_loot_reach(obs, item, 42) and can_visit(p, d):
                     choices.append((d - 9, item["id"], p))
         for drop in obs["drops"]:
             p = drop["pos"]
@@ -280,49 +292,6 @@ class Bot:
             action["pick"] = min(range(len(choices)), key=lambda i: order.index(choices[i]["id"]) if choices[i]["id"] in order else len(order))
         return action
 
-    def game_jets(self, obs, action):
-        me, now = obs["self"], obs["t"]
-        pos, move = me["pos"], action["move"]
-        moving = math.hypot(*move) > 0.5
-        stalled = False
-        if self.last_progress is None or not moving:
-            self.last_progress = tuple(pos[:2])
-            self.last_heading = move
-            self.check_progress_at = now + 0.8
-        elif now >= self.check_progress_at:
-            same_direction = sum(a*b for a,b in zip(move, self.last_heading)) > 0.5
-            stalled = same_direction and distance(pos, self.last_progress) < 2.0
-            self.last_progress = tuple(pos[:2])
-            self.last_heading = move
-            self.check_progress_at = now + 0.8
-        hit = any(e["type"] == "damaged" and e.get("by") is not None for e in obs["events"])
-        if me["grounded"]:
-            self.pulse_until = -1.0
-            if self.hop_origin is not None and now > self.pulse_started:
-                if distance(pos, self.hop_origin) < 3:
-                    self.failed_hops += 1
-                    self.failed_origin = tuple(pos[:2])
-                    self.next_hop = max(self.next_hop, now + 5)
-                self.hop_origin = None
-            if self.failed_origin is not None and distance(pos, self.failed_origin) > 6:
-                self.failed_origin = None
-                self.failed_hops = 0
-            retry_stall = stalled and self.failed_hops < 2
-            if moving and now >= self.next_hop and me["energy"] > 45 and (retry_stall or hit):
-                action["jump"] = True
-                self.hop_origin = tuple(pos[:2]) if stalled else None
-                self.pulse_started = now
-                self.pulse_until = now + (1.8 if stalled else 0.75)
-                self.next_hop = now + (3.0 if stalled else 4.2)
-            return action
-        if now < self.pulse_until:
-            head_bump = now > self.pulse_started + 0.35 and me["vel"][2] < 0.5
-            if head_bump or me["energy"] <= 25:
-                self.pulse_until = -1.0
-            else:
-                action["boost"] = True
-        return action
-
     def act(self, obs):
         goal = self.objective(obs)
         if self.rest is None:
@@ -330,7 +299,7 @@ class Bot:
             if crate:
                 gathering = self.collect_crate(obs, crate)
                 if gathering is not None:
-                    return self.game_jets(obs, gathering)
+                    return gathering
         if tuple(goal[:2]) == tuple(obs["self"]["pos"][:2]):
             recovery = goal
             self.rest = None
@@ -339,7 +308,7 @@ class Bot:
         action = self.actions(obs, self.movement(obs, recovery))
         if self.rest is not None:
             action["fire"] = [False, False]
-        return self.game_jets(obs, action)
+        return action
 
 
 def run(bot_class):
