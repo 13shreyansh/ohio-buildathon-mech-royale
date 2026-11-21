@@ -54,6 +54,9 @@ class Grid:
                                 self.clear[i] = 0
                             else:
                                 self.overhead[i] = min(self.overhead[i], gap)
+        self.overhead_limits = [(i, limit) for i, limit in enumerate(self.overhead) if math.isfinite(limit)]
+        self.cached_footprint = None
+        self.cached_walkable = None
         queue = deque()
         for i in range(size):
             x, y = i % self.w, i // self.w
@@ -108,6 +111,19 @@ class Grid:
     def open(self, i, radius, height):
         return self.clear[i] * CELL >= radius + CELL / 2 and self.overhead[i] > height
 
+    def walkable_mask(self, radius, height):
+        clearance = math.ceil((radius + CELL / 2) / CELL)
+        key = clearance, height
+        if key != self.cached_footprint:
+            eligible = bytes(int(i >= clearance) for i in range(256))
+            mask = self.clear.translate(eligible)
+            for i, limit in self.overhead_limits:
+                if limit <= height:
+                    mask[i] = 0
+            self.cached_walkable = mask
+            self.cached_footprint = key
+        return self.cached_walkable
+
     def nearest(self, pos, radius, height):
         i = self.index(pos)
         if self.open(i, radius, height):
@@ -151,6 +167,7 @@ class Navigator:
             self.path.clear()
             self.best = (math.dist(g.xy(start), g.xy(target)), start)
         tx, ty = target % g.w, target // g.w
+        walkable = g.walkable_mask(radius, height)
         for _ in range(350):
             if not self.frontier:
                 break
@@ -165,9 +182,9 @@ class Navigator:
                 break
             for dx, dy in STEPS:
                 j = i + dx + dy * g.w
-                if not g.open(j, radius, height):
+                if not walkable[j]:
                     continue
-                if dx and dy and (not g.open(i + dx, radius, height) or not g.open(i + dy * g.w, radius, height)):
+                if dx and dy and (not walkable[i + dx] or not walkable[i + dy * g.w]):
                     continue
                 length = 1.4142 if dx and dy else 1
                 if abs(g.floor[j] - g.floor[i]) > g.slope * CELL * length:
