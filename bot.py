@@ -45,8 +45,28 @@ class Bot:
             # early gives the bot little room to collect nearby upgrades.
             dx, dy = unit(pos[0] - center[0], pos[1] - center[1])
             radius = max(0, zone["next_radius"] * 0.78 - me["stats"]["radius"])
-            self.anchor = (center[0] + dx * radius, center[1] + dy * radius)
+            self.phase_anchor = (center[0] + dx * radius, center[1] + dy * radius)
             self.phase = phase
+        self.anchor = self.phase_anchor
+        first_radius = self.config["zone"]["phases"][0]["radius"]
+        if (zone["next_radius"] != first_radius or obs["t"] >= zone["shrink_start"] or
+                not me["in_zone"] or me["hp"] < 0.85 * me["max_hp"]):
+            return self.anchor
+        # Forecast the published moving game circle at the time needed to
+        # complete the default trip, including a detour allowance.
+        now = obs["t"]
+        trip = 1.6 * distance(pos, self.phase_anchor) / me["stats"]["walk_speed"] + 6
+        start = max(now, zone["shrink_start"])
+        end = zone["shrink_end"]
+        if end <= start or now + trip >= end:
+            return self.anchor
+        fraction = max(0.0, now + trip - start) / (end - start)
+        here = zone["center"]
+        future = (here[0] + fraction * (center[0] - here[0]),
+                  here[1] + fraction * (center[1] - here[1]))
+        future_radius = zone["radius"] + fraction * (zone["next_radius"] - zone["radius"])
+        if distance(pos, future) + 2 * me["stats"]["radius"] < future_radius:
+            self.anchor = tuple(pos[:2])
         return self.anchor
 
     def public_loot_reach(self, obs, item, base_reach):
