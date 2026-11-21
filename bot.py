@@ -30,6 +30,15 @@ class Bot:
         self.retry_repair = 0.0
         self.repair_started = 0.0
         self.repair_hp = 0.0
+        self.last_progress = None
+        self.check_progress_at = 0.0
+        self.last_heading = (0, 0)
+        self.pulse_until = -1.0
+        self.pulse_started = -1.0
+        self.next_hop = 0.0
+        self.hop_origin = None
+        self.failed_origin = None
+        self.failed_hops = 0
         self.crate_id = None
         self.crate_deadline = 0.0
         self.skip_crate = {}
@@ -271,6 +280,49 @@ class Bot:
             action["pick"] = min(range(len(choices)), key=lambda i: order.index(choices[i]["id"]) if choices[i]["id"] in order else len(order))
         return action
 
+    def game_jets(self, obs, action):
+        me, now = obs["self"], obs["t"]
+        pos, move = me["pos"], action["move"]
+        moving = math.hypot(*move) > 0.5
+        stalled = False
+        if self.last_progress is None or not moving:
+            self.last_progress = tuple(pos[:2])
+            self.last_heading = move
+            self.check_progress_at = now + 0.8
+        elif now >= self.check_progress_at:
+            same_direction = sum(a*b for a,b in zip(move, self.last_heading)) > 0.5
+            stalled = same_direction and distance(pos, self.last_progress) < 2.0
+            self.last_progress = tuple(pos[:2])
+            self.last_heading = move
+            self.check_progress_at = now + 0.8
+        hit = any(e["type"] == "damaged" and e.get("by") is not None for e in obs["events"])
+        if me["grounded"]:
+            self.pulse_until = -1.0
+            if self.hop_origin is not None and now > self.pulse_started:
+                if distance(pos, self.hop_origin) < 3:
+                    self.failed_hops += 1
+                    self.failed_origin = tuple(pos[:2])
+                    self.next_hop = max(self.next_hop, now + 5)
+                self.hop_origin = None
+            if self.failed_origin is not None and distance(pos, self.failed_origin) > 6:
+                self.failed_origin = None
+                self.failed_hops = 0
+            retry_stall = stalled and self.failed_hops < 2
+            if moving and now >= self.next_hop and me["energy"] > 45 and (retry_stall or hit):
+                action["jump"] = True
+                self.hop_origin = tuple(pos[:2]) if stalled else None
+                self.pulse_started = now
+                self.pulse_until = now + (1.8 if stalled else 0.75)
+                self.next_hop = now + (3.0 if stalled else 4.2)
+            return action
+        if now < self.pulse_until:
+            head_bump = now > self.pulse_started + 0.35 and me["vel"][2] < 0.5
+            if head_bump or me["energy"] <= 25:
+                self.pulse_until = -1.0
+            else:
+                action["boost"] = True
+        return action
+
     def act(self, obs):
         goal = self.objective(obs)
         if self.rest is None:
@@ -278,7 +330,7 @@ class Bot:
             if crate:
                 gathering = self.collect_crate(obs, crate)
                 if gathering is not None:
-                    return gathering
+                    return self.game_jets(obs, gathering)
         if tuple(goal[:2]) == tuple(obs["self"]["pos"][:2]):
             recovery = goal
             self.rest = None
@@ -287,7 +339,7 @@ class Bot:
         action = self.actions(obs, self.movement(obs, recovery))
         if self.rest is not None:
             action["fire"] = [False, False]
-        return action
+        return self.game_jets(obs, action)
 
 
 def run(bot_class):
