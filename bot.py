@@ -5,7 +5,7 @@ import os
 import select
 import sys
 
-from navigation import Grid, Navigator
+from navigation import CELL, Grid, Navigator
 
 
 def unit(x, y):
@@ -45,28 +45,8 @@ class Bot:
             # early gives the bot little room to collect nearby upgrades.
             dx, dy = unit(pos[0] - center[0], pos[1] - center[1])
             radius = max(0, zone["next_radius"] * 0.78 - me["stats"]["radius"])
-            self.phase_anchor = (center[0] + dx * radius, center[1] + dy * radius)
+            self.anchor = (center[0] + dx * radius, center[1] + dy * radius)
             self.phase = phase
-        self.anchor = self.phase_anchor
-        first_radius = self.config["zone"]["phases"][0]["radius"]
-        if (zone["next_radius"] != first_radius or obs["t"] >= zone["shrink_start"] or
-                not me["in_zone"] or me["hp"] < 0.85 * me["max_hp"]):
-            return self.anchor
-        # Forecast the published moving game circle at the time needed to
-        # complete the default trip, including a detour allowance.
-        now = obs["t"]
-        trip = 1.6 * distance(pos, self.phase_anchor) / me["stats"]["walk_speed"] + 6
-        start = max(now, zone["shrink_start"])
-        end = zone["shrink_end"]
-        if end <= start or now + trip >= end:
-            return self.anchor
-        fraction = max(0.0, now + trip - start) / (end - start)
-        here = zone["center"]
-        future = (here[0] + fraction * (center[0] - here[0]),
-                  here[1] + fraction * (center[1] - here[1]))
-        future_radius = zone["radius"] + fraction * (zone["next_radius"] - zone["radius"])
-        if distance(pos, future) + 2 * me["stats"]["radius"] < future_radius:
-            self.anchor = tuple(pos[:2])
         return self.anchor
 
     def public_loot_reach(self, obs, item, base_reach):
@@ -89,6 +69,24 @@ class Bot:
             if abs(crate["pos"][2] - pos[2]) < 4:
                 walking_budget = min(walking_budget, distance(pos, crate["pos"]) + 2.0 * me["stats"]["walk_speed"])
         return max(base_reach, walking_budget)
+
+    def on_floor_route(self, me, point, length):
+        grid = self.navigator.grid
+        pos = me["pos"]
+        first, last = grid.index(pos), grid.index(point)
+        if not me["grounded"] or abs(grid.floor[first] - pos[2]) > 2 or abs(grid.floor[last] - point[2]) > 2:
+            return False
+        steps = max(1, math.ceil(length / CELL))
+        previous = first
+        for j in range(1, steps + 1):
+            frac = j / steps
+            i = grid.index((pos[0] + frac * (point[0] - pos[0]), pos[1] + frac * (point[1] - pos[1])))
+            if not grid.open(i, me["stats"]["radius"], me["stats"]["height"]):
+                return False
+            if abs(grid.floor[i] - grid.floor[previous]) > grid.slope * math.dist(grid.xy(i), grid.xy(previous)):
+                return False
+            previous = i
+        return True
 
     def objective(self, obs):
         me = obs["self"]
@@ -127,7 +125,7 @@ class Bot:
         for drop in obs["drops"]:
             p = drop["pos"]
             d = distance(pos, p)
-            if drop.get("holder") not in (None, me["id"]) or abs(pos[2] - p[2]) > 4:
+            if drop.get("holder") not in (None, me["id"]):
                 continue
             if distance(p, zone["next_center"]) + drop["radius"] >= zone["next_radius"]:
                 continue
@@ -139,6 +137,8 @@ class Bot:
             if drop["lands_in"] > 1.4 * travel + 4:
                 continue
             if any(m["kind"] == "mech" and distance(p, m["pos"]) < drop["radius"] + 15 for m in obs["mechs"]):
+                continue
+            if abs(pos[2] - p[2]) > 4 and not self.on_floor_route(me, p, d):
                 continue
             value = 28 + 30 * (1 - me["hp"] / me["max_hp"])
             if d < drop["radius"] - 1:
