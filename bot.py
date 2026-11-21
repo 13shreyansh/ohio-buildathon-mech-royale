@@ -30,6 +30,9 @@ class Bot:
         self.retry_repair = 0.0
         self.repair_started = 0.0
         self.repair_hp = 0.0
+        self.explore_origin = None
+        self.explore_until = 0.0
+        self.explore_index = 0
         self.crate_id = None
         self.crate_deadline = 0.0
         self.skip_crate = {}
@@ -45,8 +48,29 @@ class Bot:
             # early gives the bot little room to collect nearby upgrades.
             dx, dy = unit(pos[0] - center[0], pos[1] - center[1])
             radius = max(0, zone["next_radius"] * 0.78 - me["stats"]["radius"])
-            self.anchor = (center[0] + dx * radius, center[1] + dy * radius)
+            self.ring_destination = (center[0] + dx * radius, center[1] + dy * radius)
             self.phase = phase
+        safe_radius = max(0, zone["next_radius"] * 0.78 - me["stats"]["radius"])
+        seeking = me["cubes"] == 0 or None in me["weapons"]
+        if (not seeking or obs["t"] >= self.config["zone"]["phases"][0]["hold_s"]
+                or distance(pos, center) > safe_radius + 3 or me["hp"] < 0.85 * me["max_hp"]
+                or obs["drops"] or any(m["kind"] == "mech" for m in obs["mechs"])):
+            self.anchor = self.ring_destination
+            self.explore_until = 0.0
+            return self.anchor
+        if self.explore_origin is None:
+            self.explore_origin = tuple(pos[:2])
+        if obs["t"] >= self.explore_until:
+            # A short triangle around the first safe tile exposes unseen floor
+            # items while keeping every waypoint within the next game circle.
+            angle = me["id"] * 2.4 + self.explore_index * math.tau / 3
+            span = min(65, safe_radius * 0.9)
+            x = self.explore_origin[0] + math.cos(angle) * span - center[0]
+            y = self.explore_origin[1] + math.sin(angle) * span - center[1]
+            scale = min(1.0, safe_radius / max(0.01, math.hypot(x, y)))
+            self.anchor = (center[0] + x * scale, center[1] + y * scale)
+            self.explore_index += 1
+            self.explore_until = obs["t"] + 7.0
         return self.anchor
 
     def public_loot_reach(self, obs, item, base_reach):
