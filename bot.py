@@ -5,7 +5,7 @@ import os
 import select
 import sys
 
-from navigation import CELL, Grid, Navigator
+from navigation import Grid, Navigator
 
 
 def unit(x, y):
@@ -25,6 +25,8 @@ class Bot:
         self.navigator = Navigator(Grid.load(hello))
         self.anchor = None
         self.phase = None
+        self.interrupted_until = 0.0
+        self.last_repair_damage = None
         self.rest = None
         self.rest_phase = None
         self.retry_repair = 0.0
@@ -70,24 +72,6 @@ class Bot:
                 walking_budget = min(walking_budget, distance(pos, crate["pos"]) + 2.0 * me["stats"]["walk_speed"])
         return max(base_reach, walking_budget)
 
-    def on_floor_route(self, me, point, length):
-        grid = self.navigator.grid
-        pos = me["pos"]
-        first, last = grid.index(pos), grid.index(point)
-        if not me["grounded"] or abs(grid.floor[first] - pos[2]) > 2 or abs(grid.floor[last] - point[2]) > 2:
-            return False
-        steps = max(1, math.ceil(length / CELL))
-        previous = first
-        for j in range(1, steps + 1):
-            frac = j / steps
-            i = grid.index((pos[0] + frac * (point[0] - pos[0]), pos[1] + frac * (point[1] - pos[1])))
-            if not grid.open(i, me["stats"]["radius"], me["stats"]["height"]):
-                return False
-            if abs(grid.floor[i] - grid.floor[previous]) > grid.slope * math.dist(grid.xy(i), grid.xy(previous)):
-                return False
-            previous = i
-        return True
-
     def objective(self, obs):
         me = obs["self"]
         pos = me["pos"]
@@ -125,7 +109,7 @@ class Bot:
         for drop in obs["drops"]:
             p = drop["pos"]
             d = distance(pos, p)
-            if drop.get("holder") not in (None, me["id"]):
+            if drop.get("holder") not in (None, me["id"]) or abs(pos[2] - p[2]) > 4:
                 continue
             if distance(p, zone["next_center"]) + drop["radius"] >= zone["next_radius"]:
                 continue
@@ -137,8 +121,6 @@ class Bot:
             if drop["lands_in"] > 1.4 * travel + 4:
                 continue
             if any(m["kind"] == "mech" and distance(p, m["pos"]) < drop["radius"] + 15 for m in obs["mechs"]):
-                continue
-            if abs(pos[2] - p[2]) > 4 and not self.on_floor_route(me, p, d):
                 continue
             value = 28 + 30 * (1 - me["hp"] / me["max_hp"])
             if d < drop["radius"] - 1:
@@ -318,6 +300,17 @@ class Bot:
         return action
 
     def act(self, obs):
+        # One reset may still lead to an uninterrupted repair. Resume
+        # ordinary inputs briefly only after two resets within half a delay.
+        if self.rest is None:
+            self.interrupted_until = 0.0
+            self.last_repair_damage = None
+        elif any(e["type"] == "damaged" and e["amount"] > 0 for e in obs["events"]):
+            now = obs["t"]
+            delay = obs["self"]["stats"]["regen_delay"]
+            if self.last_repair_damage is not None and now - self.last_repair_damage <= delay / 2:
+                self.interrupted_until = now + delay / 5
+            self.last_repair_damage = now
         goal = self.objective(obs)
         if self.rest is None:
             crate = self.crate_goal(obs, goal)
@@ -331,7 +324,7 @@ class Bot:
         else:
             recovery = self.recovery_goal(obs, goal)
         action = self.actions(obs, self.movement(obs, recovery))
-        if self.rest is not None:
+        if self.rest is not None and obs["t"] >= self.interrupted_until:
             action["fire"] = [False, False]
         return action
 
