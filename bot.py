@@ -30,9 +30,7 @@ class Bot:
         self.retry_repair = 0.0
         self.repair_started = 0.0
         self.repair_hp = 0.0
-        self.explore_origin = None
-        self.explore_until = 0.0
-        self.explore_index = 0
+        self.running = False
         self.crate_id = None
         self.crate_deadline = 0.0
         self.skip_crate = {}
@@ -48,29 +46,8 @@ class Bot:
             # early gives the bot little room to collect nearby upgrades.
             dx, dy = unit(pos[0] - center[0], pos[1] - center[1])
             radius = max(0, zone["next_radius"] * 0.78 - me["stats"]["radius"])
-            self.ring_destination = (center[0] + dx * radius, center[1] + dy * radius)
+            self.anchor = (center[0] + dx * radius, center[1] + dy * radius)
             self.phase = phase
-        safe_radius = max(0, zone["next_radius"] * 0.78 - me["stats"]["radius"])
-        seeking = me["cubes"] == 0 or None in me["weapons"]
-        if (not seeking or obs["t"] >= self.config["zone"]["phases"][0]["hold_s"]
-                or distance(pos, center) > safe_radius + 3 or me["hp"] < 0.85 * me["max_hp"]
-                or obs["drops"] or any(m["kind"] == "mech" for m in obs["mechs"])):
-            self.anchor = self.ring_destination
-            self.explore_until = 0.0
-            return self.anchor
-        if self.explore_origin is None:
-            self.explore_origin = tuple(pos[:2])
-        if obs["t"] >= self.explore_until:
-            # A short triangle around the first safe tile exposes unseen floor
-            # items while keeping every waypoint within the next game circle.
-            angle = me["id"] * 2.4 + self.explore_index * math.tau / 3
-            span = min(65, safe_radius * 0.9)
-            x = self.explore_origin[0] + math.cos(angle) * span - center[0]
-            y = self.explore_origin[1] + math.sin(angle) * span - center[1]
-            scale = min(1.0, safe_radius / max(0.01, math.hypot(x, y)))
-            self.anchor = (center[0] + x * scale, center[1] + y * scale)
-            self.explore_index += 1
-            self.explore_until = obs["t"] + 7.0
         return self.anchor
 
     def public_loot_reach(self, obs, item, base_reach):
@@ -197,6 +174,29 @@ class Bot:
         # following decision the original loose-cube policy takes over.
         return crate
 
+    def ground_transit(self, obs, action, goal):
+        me = obs["self"]
+        if not me["in_zone"]:
+            self.running = False
+            return
+        # Build up speed on long ground trips while retaining energy for the
+        # next game objective. A sharp turn or a short approach ends the burst.
+        move = action["move"]
+        forward_speed = me["vel"][0] * move[0] + me["vel"][1] * move[1]
+        zone = obs["zone"]
+        if goal == self.anchor and distance(me["pos"], zone["next_center"]) < zone["next_radius"] - 10:
+            self.running = False
+            return
+        minimum_energy = 55 if self.running else 90
+        self.running = (
+            me["grounded"] and me["energy"] >= minimum_energy
+            and distance(me["pos"], goal) > (25 if self.running else 42)
+            and forward_speed > 0.75 * me["stats"]["walk_speed"]
+            and not any(m["kind"] == "mech" for m in obs["mechs"])
+            and self.rest is None
+        )
+        action["boost"] = self.running
+
     def collect_crate(self, obs, crate):
         me, p = obs["self"], crate["pos"]
         pos = me["pos"]
@@ -213,6 +213,7 @@ class Bot:
                 return None
             move = self.movement(obs, stance)
         action = self.actions(obs, move)
+        self.ground_transit(obs, action, p)
         yaw = math.atan2(p[1] - pos[1], p[0] - pos[0])
         pitch = math.atan2(p[2] + self.config["crates"]["height"] / 2 - pos[2] - me["stats"]["muzzle_height"], d)
         action["aim"] = (yaw, pitch)
@@ -335,6 +336,7 @@ class Bot:
         else:
             recovery = self.recovery_goal(obs, goal)
         action = self.actions(obs, self.movement(obs, recovery))
+        self.ground_transit(obs, action, recovery)
         if self.rest is not None:
             action["fire"] = [False, False]
         return action
