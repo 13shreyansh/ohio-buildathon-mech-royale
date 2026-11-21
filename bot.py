@@ -109,9 +109,14 @@ class Bot:
             d = distance(pos, p)
             if drop.get("holder") not in (None, me["id"]) or abs(pos[2] - p[2]) > 4:
                 continue
-            if d > 55 or distance(p, zone["next_center"]) + drop["radius"] >= zone["next_radius"]:
+            if distance(p, zone["next_center"]) + drop["radius"] >= zone["next_radius"]:
                 continue
-            if drop["lands_in"] > max(0, d - drop["radius"]) / speed + 1:
+            travel = max(0, d - drop["radius"]) / speed
+            # Announced drops can justify a longer trip before landing. Once a
+            # drop has landed, limit the detour to a shorter collection window.
+            if travel > (14 if drop["lands_in"] > 0 else 9):
+                continue
+            if drop["lands_in"] > 1.4 * travel + 4:
                 continue
             if any(m["kind"] == "mech" and distance(p, m["pos"]) < drop["radius"] + 15 for m in obs["mechs"]):
                 continue
