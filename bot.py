@@ -30,6 +30,16 @@ class Bot:
         self.retry_repair = 0.0
         self.repair_started = 0.0
         self.repair_hp = 0.0
+        self.previous_ids = set()
+        self.contact_until = {}
+        self.next_probe = {}
+        self.focus_id = None
+        self.withdraw_until = -1.0
+        self.escape = None
+        self.escape_phase = None
+        self.escape_refresh = -1.0
+        match = self.config["match"]
+        self.frame = match["decide_every"] / match["tick_hz"]
 
     def zone_goal(self, obs):
         me = obs["self"]
@@ -148,6 +158,88 @@ class Bot:
             return (0.0, 0.0)
         return unit(goal[0] - pos[0], goal[1] - pos[1])
 
+    def encounter(self, obs):
+        me, now = obs["self"], obs["t"]
+        pos = me["pos"]
+        players = [avatar for avatar in obs["mechs"] if avatar["kind"] == "mech"]
+        ids = {a["id"] for a in players}
+        # The server keeps publishing a mech for five seconds after it was
+        # last seen. A newly published id and game hit events are stronger
+        # evidence than continued presence in that list.
+        for actor in ids - self.previous_ids:
+            self.contact_until[actor] = now + 0.75
+            self.next_probe[actor] = now + 1.5
+        for event in obs["events"]:
+            if event["type"] == "hit" and event.get("target") in ids:
+                self.contact_until[event["target"]] = now + 0.6
+        self.previous_ids = ids
+        near = self.config["vision"]["near_range"] + me["stats"].get("near_range_bonus", 0)
+        pressure = [a for a in players if distance(pos, a["pos"]) < 2.8 * near]
+        if len(pressure) >= 2 or (pressure and me["hp"] < 0.60 * me["max_hp"]):
+            self.withdraw_until = now + 1.6
+        withdrawing = now < self.withdraw_until
+        candidates = []
+        for a in players:
+            dx, dy = a["pos"][0] - pos[0], a["pos"][1] - pos[1]
+            d = math.hypot(dx, dy)
+            yaw = math.atan2(dy, dx)
+            vision = self.config["vision"]
+            if d > vision["range"] + me["stats"].get("vision_bonus", 0):
+                continue
+            if d > near and abs(math.remainder(yaw - me["aim"][0], math.tau)) > math.radians(vision["fov_deg"] / 2):
+                continue
+            candidates.append(a)
+        # Keep the same avatar selected through small range-order changes.
+        # Prefer contacts with recent server evidence when switching.
+        viable = [a for a in candidates if now <= self.contact_until.get(a["id"], -1)]
+        pool = viable or candidates
+        target = next((a for a in pool if a["id"] == self.focus_id), None)
+        if target is None and pool:
+            target = min(pool, key=lambda a: (distance(pos, a["pos"]), a["id"]))
+        self.focus_id = target["id"] if target else None
+        return target, pressure, withdrawing
+
+    def withdraw_goal(self, obs, pressure):
+        me, zone = obs["self"], obs["zone"]
+        pos, now = me["pos"], obs["t"]
+        radius = me["stats"]["radius"]
+        inset = max(0, zone["next_radius"] - radius)
+        remaining = max(0, distance(pos, zone["next_center"]) - inset)
+        urgent = remaining > 0 and remaining * 1.5 / me["stats"]["walk_speed"] + 6 > zone["shrink_end"] - now
+        if not me["in_zone"] or urgent:
+            self.escape = None
+            return self.zone_goal(obs)
+        if self.escape_phase == self.phase and self.escape is not None and now < self.escape_refresh:
+            return self.escape
+        if not pressure:
+            return self.zone_goal(obs)
+        grid = self.navigator.grid
+        choices = []
+        for i in range(16):
+            angle = i * math.tau / 16
+            point = (pos[0] + 44 * math.cos(angle), pos[1] + 44 * math.sin(angle))
+            j = grid.index(point)
+            point = grid.xy(j)
+            if not grid.open(j, radius, me["stats"]["height"]):
+                continue
+            if distance(point, zone["center"]) > zone["radius"] - radius:
+                continue
+            if distance(point, zone["next_center"]) > inset + remaining:
+                continue
+            # Only consider withdrawal moves with a walkable approach. A goal
+            # on the other side of a wall can send A* outside the game ring.
+            steps = max(1, math.ceil(distance(pos, point) / 2))
+            if any(not grid.open(grid.index((pos[0] + (point[0]-pos[0])*k/steps,
+                                             pos[1] + (point[1]-pos[1])*k/steps)),
+                                 radius, me["stats"]["height"]) for k in range(1, steps+1)):
+                continue
+            separation = min(distance(point, a["pos"]) for a in pressure)
+            choices.append((separation - 0.12 * distance(point, self.anchor), point))
+        self.escape = max(choices)[1] if choices else self.zone_goal(obs)
+        self.escape_phase = self.phase
+        self.escape_refresh = now + 1.6
+        return self.escape
+
     def slots(self, obs, target, yaw, pitch):
         me = obs["self"]
         d = math.dist(target["pos"], me["pos"])
@@ -169,19 +261,31 @@ class Bot:
             held.append(trigger)
         return held
 
-    def actions(self, obs, move):
+    def actions(self, obs, move, target):
         me = obs["self"]
         pos = me["pos"]
         action = {"tick": obs["tick"], "move": move, "boost": not me["in_zone"] and me["grounded"] and me["energy"] > 25}
-        visible = [p for p in obs["mechs"] if p["kind"] == "mech"]
-        if visible:
-            target = min(visible, key=lambda item: distance(pos, item["pos"]))
+        if target:
             p = target["pos"]
+            # For the default slot, use the avatar position one game decision
+            # ahead. Instant slots use the current animation frame.
+            if not any(w and w["kind"] in ("laser", "lightning") and w["cooldown"] <= self.frame for w in me["weapons"]):
+                vel = target.get("vel", (0, 0, 0))
+                p = [v + self.frame * dv for v, dv in zip(p, vel)]
             yaw = math.atan2(p[1] - pos[1], p[0] - pos[0])
             avatar_height = self.config["mech"]["height"] * (1 + self.config["cubes"]["size_per_cube"] * target.get("cubes", 0))
             pitch = math.atan2(p[2] + avatar_height / 2 - pos[2] - me["stats"]["muzzle_height"], distance(pos, p))
             action["aim"] = [yaw, pitch]
-            action["fire"] = self.slots(obs, target, yaw, pitch)
+            fire = self.slots(obs, target, yaw, pitch)
+            actor, now = target["id"], obs["t"]
+            if now > self.contact_until.get(actor, -1):
+                # A visible-list entry can be memory only. Permit a single
+                # basic-slot check, then require a hit event to resume.
+                probe = now >= self.next_probe.get(actor, 0)
+                fire = [bool(f and probe and w and w["kind"] == "gun") for f, w in zip(fire, me["weapons"])]
+                if any(fire):
+                    self.next_probe[actor] = now + 1.6
+            action["fire"] = fire
         else:
             action["aim"] = [obs["t"] * 0.9 % math.tau - math.pi, 0.0]
             action["reload"] = any(w and w["kind"] == "gun" and w["ammo"] < w["stats"]["mag"] * 0.8 for w in me["weapons"])
@@ -199,13 +303,20 @@ class Bot:
 
     def act(self, obs):
         goal = self.objective(obs)
-        if tuple(goal[:2]) == tuple(obs["self"]["pos"][:2]):
+        target, pressure, withdrawing = self.encounter(obs)
+        if withdrawing:
+            self.rest = None
+            recovery = self.withdraw_goal(obs, pressure)
+        elif tuple(goal[:2]) == tuple(obs["self"]["pos"][:2]):
             recovery = goal
             self.rest = None
         else:
             recovery = self.recovery_goal(obs, goal)
-        action = self.actions(obs, self.movement(obs, recovery))
-        if self.rest is not None:
+        action = self.actions(obs, self.movement(obs, recovery), target)
+        if withdrawing:
+            me = obs["self"]
+            action["boost"] = me["grounded"] and me["energy"] > 25 and any(action["move"])
+        if self.rest is not None or withdrawing:
             action["fire"] = [False, False]
         return action
 
